@@ -6,4 +6,4 @@ opencv-python
 imageio
 torch
 opencv-python
-mediapipe==0.10.31
+mediapipe==0.10.13
