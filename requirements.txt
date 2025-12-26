@@ -1,0 +1,9 @@
+flask
+flask-cors
+uvicorn
+asgiref
+opencv-python
+imageio
+torch
+opencv-python
+mediapipe==0.10.13
