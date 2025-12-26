@@ -31,8 +31,6 @@ CONFIG = {
 
 # MediaPipe 初始化
 mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
-
 
 def process_single_video_worker(args):
     """处理单个视频的辅助函数（用于多进程）"""
