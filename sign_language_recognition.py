@@ -18,8 +18,8 @@ CONFIG = {
     'data_dir': '/root/autodl-tmp/data',
     'output_dir': '/root/autodl-nus/sign_language_output',
     'train_dataset_dir': '/root/autodl-nus/train_dataset',
-    'model_save_path': '/root/autodl-nus/sign_language_model.pth',
-    'sequence_length': 30,  # 每个手势的帧数
+    'model_save_path': 'sign_language_model.pth',
+    'sequence_length': 120,  # 每个手势的帧数
     'input_size': 258,  # MediaPipe 关键点维度 (33*4 + 21*3 + 21*3)
     'hidden_size': 64,
     'num_epochs': 200,

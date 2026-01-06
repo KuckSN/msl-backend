@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MSL sign language backend API
+
+- /health           : health check
+- /predict          : uploaded video -> sequence of tokens + sentence
+- /predict_camera   : streaming single frames -> one token at a time
+"""
+import logging
 import os
 import tempfile
 import base64
@@ -15,7 +25,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 # ---- IMPORT FROM YOUR ML ENGINEER'S MODULE ----
-# Make sure sign_language_recognition.py is in the same folder or on PYTHONPATH
 from sign_language_recognition import SignLanguageLSTM, MediaPipeProcessor, CONFIG
 
 # ============================================================
@@ -23,77 +32,70 @@ from sign_language_recognition import SignLanguageLSTM, MediaPipeProcessor, CONF
 # ============================================================
 
 # Demo vs real model
-DEV_MODE = False  # <-- set True for your old dummy demo, False to use real model
+DEV_MODE = False  # <-- set True for dummy demo, False to use real model
 
-# Path to your .pth model (adjust if needed)
-MODEL_PATH = os.environ.get("MSL_MODEL_PATH", "sign_language_model.pth")
+# Model path resolution
+MODEL_PATH = (
+    os.environ.get("MSL_MODEL_PATH")
+    or os.environ.get("MODEL_PATH")
+    or CONFIG.get("model_save_path", "sign_language_model.pth")
+)
 
 app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-# REAL-TIME CAMERA CONSTANTS (used in DEV_MODE only)
+# REAL-TIME CAMERA CONSTANTS (DEV_MODE only)
 # ============================================================
 
 CAMERA_DEMO_SEQUENCE = [
     {"gloss": "hi", "translation": "hi"},
-    {"gloss": "apa_khabar", "translation": "apa khabar"},
     {"gloss": "hari", "translation": "hari"},
     {"gloss": "hujan", "translation": "hujan"},
     {"gloss": "jangan", "translation": "jangan"},
-    {"gloss": "curi", "translation": "curi (steal)"},
-    {"gloss": "payung", "translation": "payung"},
 ]
 
-
+# Which glosses are considered "temporal" (need motion / GIF)
 CAMERA_TEMPORAL_GLOSSES = {
-    "abang", "ambil", "apa_khabar", "ayah", "bapa", "bapa_saudara", "bawa", "buat", "curi", "hari", "hi", "hujan", "jangan", "kakak", "lelaki", "lemak", "lupa", "main", "marah", "minum", "panas_2", "payung", "pergi", "pukul", "ribut", "siapa", "tanya"
+    "ambil", "hari", "hi", "hujan", "jangan",
+    "kakak", "keluarga", "kereta", "lemak", "lupa",
+    "marah", "minum", "pergi", "pukul", "tanya",
 }
 
-GLOSS_TRANSLATIONS = {
-    "abang": "abang",
+# Gloss → human-friendly translation (you can extend this)
+GLOSS_TRANSLATIONS: Dict[str, str] = {
     "ambil": "ambil (take)",
-    "apa_khabar": "apa khabar",
-    "ayah": "ayah",
-    "bapa": "bapa",
-    "bapa_saudara": "bapa saudara",
-    "bawa": "bawa (bring)",
-    "buat": "buat (do/make)",
-    "curi": "curi (steal)",
-    "hari": "hari",
+    "hari": "hari (day)",
     "hi": "hi",
     "hujan": "hujan (rain)",
-    "jangan": "jangan",
-    "kakak": "kakak",
-    "lelaki": "lelaki",
-    "lemak": "lemak (fatty)",
+    "jangan": "jangan (don't)",
+    "kakak": "kakak (sister)",
+    "keluarga": "keluarga (family)",
+    "kereta": "kereta (car)",
+    "lemak": "lemak (oil)",
     "lupa": "lupa (forget)",
-    "main": "main (play)",
     "marah": "marah (angry)",
     "minum": "minum (drink)",
-    "panas_2": "panas",
-    "payung": "payung (umbrella)",
     "pergi": "pergi (go)",
     "pukul": "pukul (hit)",
-    "ribut": "ribut (storm)",
-    "siapa": "siapa",
     "tanya": "tanya (ask)",
 }
 
-
 # Per-session sliding buffers (for real-time camera)
-SESSION_BUFFERS: dict[str, List[np.ndarray]] = {}
-SESSION_STATE: dict[str, dict] = {}
+SESSION_BUFFERS: Dict[str, List[np.ndarray]] = {}
+SESSION_STATE: Dict[str, Dict] = {}
 
-MAX_BUFFER_FRAMES = 45        # keep last ~1–2 seconds worth (depending on fps)
-FRAMES_PER_TOKEN_MIN = 10     # demo: need at least this many frames to “detect” a sign
+MAX_BUFFER_FRAMES = 150          # keep last ~1–2 seconds worth
+FRAMES_PER_TOKEN_MIN = 30        # DEMO: min frames before emitting token
 
 # ============================================================
 # GENERIC VIDEO/IMAGE HELPERS (for thumbnails & GIFs)
 # ============================================================
 
 def get_translation(gloss: str) -> str:
+    """Map gloss to translation, fallback to gloss itself."""
     return GLOSS_TRANSLATIONS.get(gloss.lower(), gloss)
+
 
 def get_video_metadata(video_path: str) -> Tuple[int, float]:
     """Return (frame_count, fps) for a video file."""
@@ -106,7 +108,7 @@ def get_video_metadata(video_path: str) -> Tuple[int, float]:
     return frame_count, fps
 
 
-def frame_to_data_url(frame) -> Optional[str]:
+def frame_to_data_url(frame: np.ndarray) -> Optional[str]:
     """Encode a single BGR frame (OpenCV) to a JPEG data URL."""
     if frame is None:
         return None
@@ -149,7 +151,7 @@ def extract_gif_for_segment(
     """
     Build an animated GIF for a sign segment [start_frame, end_frame].
     - max_frames: upper bound on frames used in GIF
-    - target_seconds: approximate loop duration for the GIF
+    - target_seconds: approximate loop duration
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -169,7 +171,7 @@ def extract_gif_for_segment(
     total = end - start + 1
     step = max(1, total // max_frames)
 
-    frames_rgb = []
+    frames_rgb: List[np.ndarray] = []
     for idx in range(start, end + 1, step):
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
@@ -293,7 +295,7 @@ def gif_from_frames(
 
 
 # ============================================================
-# MODEL INTEGRATION (from your ML engineer)
+# MODEL INTEGRATION (merged with backend_api.py)
 # ============================================================
 
 model: Optional[nn.Module] = None
@@ -305,7 +307,7 @@ processor: Optional[MediaPipeProcessor] = None
 
 
 def load_model(model_path: str):
-    """Load trained model from .pth checkpoint."""
+    """Load trained model from .pth checkpoint (backend_api version)."""
     global model, gestures, label_map, config, device, processor
 
     if not os.path.exists(model_path):
@@ -315,10 +317,24 @@ def load_model(model_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = MediaPipeProcessor()
 
+    print(f"[MSL] Loading model from {model_path} ...")
     checkpoint = torch.load(model_path, map_location=device)
+
+    required_keys = ["gestures", "label_map", "config", "model_state_dict"]
+    missing_keys = [k for k in required_keys if k not in checkpoint]
+    if missing_keys:
+        raise ValueError(f"Model checkpoint missing keys: {missing_keys}")
+
     gestures_cp = checkpoint["gestures"]
     label_map_cp = checkpoint["label_map"]
     config_cp = checkpoint["config"]
+
+    print("[MSL] Model config:")
+    print(f"  - gestures: {len(gestures_cp)}")
+    print(f"  - sequence_length: {config_cp.get('sequence_length', 'N/A')}")
+    print(f"  - input_size: {config_cp.get('input_size', 'N/A')}")
+    print(f"  - hidden_size: {config_cp.get('hidden_size', 'N/A')}")
+    print(f"  - device: {device}")
 
     slr_model = SignLanguageLSTM(
         config_cp["input_size"],
@@ -334,131 +350,100 @@ def load_model(model_path: str):
     config = config_cp
     model = slr_model
 
-    print(f"[MSL] Model loaded. Gestures: {len(gestures)}")
+    print(f"✅ Model loaded. Gestures: {len(gestures)}")
+    print(f"Gestures list: {gestures}")
     return model
 
-
 def extract_keypoints(results) -> np.ndarray:
-    """Extract pose + left/right hand keypoints from MediaPipe results."""
-    pose = (
-        np.array(
-            [[res.x, res.y, res.z, res.visibility]
-             for res in results.pose_landmarks.landmark]
-        ).flatten()
-        if results.pose_landmarks
-        else np.zeros(33 * 4)
-    )
-
-    lh = (
-        np.array(
-            [[res.x, res.y, res.z]
-             for res in results.left_hand_landmarks.landmark]
-        ).flatten()
-        if results.left_hand_landmarks
-        else np.zeros(21 * 3)
-    )
-
-    rh = (
-        np.array(
-            [[res.x, res.y, res.z]
-             for res in results.right_hand_landmarks.landmark]
-        ).flatten()
-        if results.right_hand_landmarks
-        else np.zeros(21 * 3)
-    )
-
+    """从 MediaPipe 结果中提取关键点"""
+    pose = np.array([[res.x, res.y, res.z, res.visibility] 
+                    for res in results.pose_landmarks.landmark]).flatten() \
+        if results.pose_landmarks else np.zeros(33 * 4)
+    
+    lh = np.array([[res.x, res.y, res.z] 
+                  for res in results.left_hand_landmarks.landmark]).flatten() \
+        if results.left_hand_landmarks else np.zeros(21 * 3)
+    
+    rh = np.array([[res.x, res.y, res.z] 
+                  for res in results.right_hand_landmarks.landmark]).flatten() \
+        if results.right_hand_landmarks else np.zeros(21 * 3)
+    
     return np.concatenate([pose, lh, rh])
 
 
-def process_frames_to_sequence(
-    frames: List[np.ndarray],
-    max_frames: int = 30,
-) -> Optional[np.ndarray]:
-    """Convert a sequence of frames into a fixed-length keypoint sequence."""
-    global processor
-
-    if processor is None:
-        processor = MediaPipeProcessor()
-
+def process_frames_to_sequence(frames: List[np.ndarray], max_frames: Optional[int] = None) -> Optional[np.ndarray]:
+    """将帧序列转换为关键点序列"""
+    # 如果没有指定max_frames，使用config中的sequence_length
+    if max_frames is None:
+        if config is None:
+            raise RuntimeError("config未初始化，请先加载模型")
+        max_frames = config.get('sequence_length', 120)
+    
     keypoints_sequence = []
-
+    
     for frame in frames:
+        # 处理帧
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_rgb.flags.writeable = False
         results = processor.holistic.process(frame_rgb)
         frame_rgb.flags.writeable = True
-
+        
+        # 只保存检测到手部的帧
         if results.left_hand_landmarks or results.right_hand_landmarks:
             keypoints = extract_keypoints(results)
             keypoints_sequence.append(keypoints)
-
+    
     if len(keypoints_sequence) == 0:
         return None
-
+    
+    # 填充或截断到固定长度（120帧）
     if len(keypoints_sequence) < max_frames:
         last_frame = keypoints_sequence[-1]
-        keypoints_sequence.extend(
-            [last_frame] * (max_frames - len(keypoints_sequence))
-        )
+        keypoints_sequence.extend([last_frame] * (max_frames - len(keypoints_sequence)))
     else:
         keypoints_sequence = keypoints_sequence[:max_frames]
-
+    
     return np.array(keypoints_sequence)
 
 
 def predict_sequence(keypoints_seq: np.ndarray) -> Tuple[Optional[str], float]:
-    """Predict a gesture from a keypoint sequence."""
+    """预测关键点序列对应的手势"""
     if keypoints_seq is None:
         return None, 0.0
-
-    global model, device, gestures
-    if model is None or gestures is None:
-        return None, 0.0
-
+    
+    # 转换为tensor
     keypoints_tensor = torch.FloatTensor(keypoints_seq).unsqueeze(0).to(device)
-
+    
     with torch.no_grad():
         outputs = model(keypoints_tensor)
         probabilities = torch.softmax(outputs, dim=1)
         confidence, predicted = torch.max(probabilities, 1)
-
+    
     predicted_gesture = gestures[predicted.item()]
     confidence_score = confidence.item()
+    
     return predicted_gesture, confidence_score
 
 
 def is_temporal_sign(gloss: str) -> bool:
     """Decide if a sign is temporal (requires motion)."""
-    temporal_keywords = ["abang", "ambil", "apa_khabar", "ayah", "bapa", "bapa_saudara", "bawa", "buat", "curi", "hari", "hi", "hujan", "jangan", "kakak", "lelaki", "lemak", "lupa", "main", "marah", "minum", "panas_2", "payung", "pergi", "pukul", "ribut", "siapa", "tanya"]
-    return any(keyword in gloss.lower() for keyword in temporal_keywords)
-
-
-def get_translation(gloss: str) -> str:
-    """Map gloss to translation (for now: return gloss)."""
-    return gloss
+    return gloss.lower() in CAMERA_TEMPORAL_GLOSSES
 
 
 def predict_sign(video_path: str, model_obj=None) -> Dict:
     """
     Offline video processing – full gesture sequence.
-
-    Returns:
-      {
-        "tokens": [...],
-        "sentence": "..."
-      }
+    (This is the backend_api sliding-window logic.)
     """
-    global config
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"tokens": [], "sentence": ""}
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0 or fps < 1:
-        fps = 30.0
+        fps = 30.0  # default FPS
 
-    all_frames: List[np.ndarray] = []
+    all_frames = []
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -470,30 +455,65 @@ def predict_sign(video_path: str, model_obj=None) -> Dict:
         return {"tokens": [], "sentence": ""}
 
     sequence_length = config["sequence_length"]
-    step_size = max(1, sequence_length // 3)
+    step_size = max(1, sequence_length // 3)  # overlap 2/3
 
-    tokens: List[Dict] = []
+    tokens = []
     current_start = 0
     last_gloss = None
     last_end = -1
 
-    while current_start + sequence_length <= len(all_frames):
-        window_frames = all_frames[current_start : current_start + sequence_length]
+    # 如果视频帧数不足120帧，仍然尝试预测（使用所有可用帧）
+    if len(all_frames) < sequence_length:
+        window_frames = all_frames
         keypoints_seq = process_frames_to_sequence(window_frames, sequence_length)
-
+        
         if keypoints_seq is not None:
             gloss, confidence = predict_sequence(keypoints_seq)
-
             if gloss and confidence > 0.5:
+                token = {
+                    "gloss": gloss,
+                    "translation": get_translation(gloss),
+                    "confidence": float(confidence),
+                    "temporal": is_temporal_sign(gloss),
+                    "start_frame": 0,
+                    "end_frame": len(all_frames) - 1,
+                    "fps": float(fps)
+                }
+                return {
+                    "tokens": [token],
+                    "sentence": get_translation(gloss),
+                    "warning": f"视频帧数不足{sequence_length}帧（实际{len(all_frames)}帧），预测结果可能不够准确"
+                }
+        
+        # 无法提取有效手势
+        return {
+            "tokens": [],
+            "sentence": "",
+            "error": f"视频帧数不足{sequence_length}帧（实际{len(all_frames)}帧），且无法提取有效手势",
+            "frame_count": len(all_frames),
+            "required_frames": sequence_length
+        }
+    
+    while current_start + sequence_length <= len(all_frames):
+        # 提取当前窗口的帧
+        window_frames = all_frames[current_start:current_start + sequence_length]
+        
+        # 处理帧序列（提取120帧的关键点）
+        keypoints_seq = process_frames_to_sequence(window_frames, sequence_length)
+        
+        if keypoints_seq is not None:
+            # 预测手势
+            gloss, confidence = predict_sequence(keypoints_seq)
+            
+            if gloss and confidence > 0.5:  # 置信度阈值
                 end_frame = current_start + sequence_length - 1
-
+                
+                # 如果与上一个token相同，扩展范围
                 if last_gloss == gloss and current_start <= last_end + step_size:
-                    tokens[-1]["end_frame"] = int(end_frame)
-                    tokens[-1]["confidence"] = max(
-                        tokens[-1]["confidence"],
-                        float(confidence),
-                    )
+                    tokens[-1]['end_frame'] = int(end_frame)
+                    tokens[-1]['confidence'] = max(tokens[-1]['confidence'], float(confidence))
                 else:
+                    # 新的手势token
                     token = {
                         "gloss": gloss,
                         "translation": get_translation(gloss),
@@ -501,18 +521,20 @@ def predict_sign(video_path: str, model_obj=None) -> Dict:
                         "temporal": is_temporal_sign(gloss),
                         "start_frame": int(current_start),
                         "end_frame": int(end_frame),
-                        "fps": float(fps),
+                        "fps": float(fps)
                     }
                     tokens.append(token)
                     last_gloss = gloss
                     last_end = end_frame
-
+        
         current_start += step_size
-
-    sentence = " ".join([token["translation"] for token in tokens])
+    
+    # 构建句子
+    sentence = " ".join([token['translation'] for token in tokens])
+    
     return {
         "tokens": tokens,
-        "sentence": sentence,
+        "sentence": sentence
     }
 
 
@@ -522,39 +544,29 @@ def run_msl_model_on_frames(
 ) -> Optional[Dict]:
     """
     Streaming / real-time frames → one token or None.
-
-    Returns:
-      None
-      or token:
-      {
-        "gloss": "SAYA",
-        "translation": "...",
-        "confidence": 0.93,
-        "temporal": True/False,
-        "start_frame": <idx in this buffer>,
-        "end_frame": <idx in this buffer>,
-        "fps": 30.0
-      }
+    Backend_api logic, but used by /predict_camera.
     """
-    global config
     if config is None:
-        return None
+        raise RuntimeError("config未初始化，请先加载模型")
+    
+    sequence_length = config['sequence_length']  # 120帧
+    
+    if len(frames_bgr) < sequence_length:
+        return None  # 帧数不足，继续缓冲
 
-    seq_len = config["sequence_length"]
-    if len(frames_bgr) < seq_len:
-        return None
+    # Use the most recent sequence_length frames
+    recent_frames = frames_bgr[-sequence_length:]
 
-    recent_frames = frames_bgr[-seq_len:]
-    keypoints_seq = process_frames_to_sequence(recent_frames, seq_len)
+    keypoints_seq = process_frames_to_sequence(recent_frames, sequence_length)
 
     if keypoints_seq is None:
-        return None
+        return None  # no hands detected
 
     gloss, confidence = predict_sequence(keypoints_seq)
-    if not gloss or confidence < 0.6:
+    if not gloss or confidence < 0.6:  # stricter threshold
         return None
 
-    start_frame = len(frames_bgr) - seq_len
+    start_frame = len(frames_bgr) - sequence_length
     end_frame = len(frames_bgr) - 1
 
     token = {
@@ -564,12 +576,12 @@ def run_msl_model_on_frames(
         "temporal": is_temporal_sign(gloss),
         "start_frame": int(start_frame),
         "end_frame": int(end_frame),
-        "fps": 30.0,
+        "fps": 30.0,  # assumed FPS for streaming
     }
     return token
 
 
-# Load model at startup (unless in demo mode)
+# Load model at import time (unless in demo mode)
 if not DEV_MODE:
     load_model(MODEL_PATH)
 
@@ -577,17 +589,16 @@ if not DEV_MODE:
 # FLASK ROUTES
 # ============================================================
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify(
-        {
-            "status": "ok",
-            "dev_mode": DEV_MODE,
-            "model_loaded": model is not None,
-            "num_gestures": len(gestures) if gestures else 0,
-        }
-    ), 200
-
+@app.route('/health', methods=['GET'])
+def health_check():
+    """健康检查"""
+    return jsonify({
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "num_gestures": len(gestures) if gestures else 0,
+        "sequence_length": config.get('sequence_length', 'N/A') if config else 'N/A',
+        "model_version": "v3"
+    })
 
 @app.route("/predict", methods=["POST"])
 def predict_route():
@@ -670,6 +681,8 @@ def predict_route():
         sentence = result.get("sentence", "")
 
         tokens = add_visuals_to_tokens(tmp_path, tokens)
+
+        logging.info(f"{result}")
 
         # Frontend normalizePrediction() accepts sequence or tokens
         return jsonify(
